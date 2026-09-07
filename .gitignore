@@ -1,0 +1,9 @@
+# Ignore everything by default
+*
+
+# Track URM FEM source and outputs
+!.gitignore
+!urm_wall_fem2d.py
+!urm_wall_mesh.py
+!urm_wall_render.py
+!urm_fem2d_zt_em.png
