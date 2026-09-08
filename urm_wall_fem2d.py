@@ -792,21 +792,24 @@ def apply_bcs(K: np.ndarray, f: np.ndarray,
 # Newton-Raphson solver (incremental + iterative)
 # ============================================================
 
-def solve_wall(mesh: FEMesh, cfg: WallConfig) -> Dict:
+def solve_wall(mesh: FEMesh, cfg: WallConfig,
+               p_iface_override: Optional[IFaceParams] = None,
+               sigma_v: float = SIGMA_V,
+               u_total: float = U_TOTAL,
+               n_steps: int = N_STEPS) -> Dict:
     """
     Incremental-iterative Newton-Raphson solver.
     Loading:
       1. Single elastic step for vertical pre-compression.
       2. Monotonic horizontal displacement ramp at top nodes.
 
-    Critical fix: interface states are deepcopied before each Newton iteration
-    so that states are only committed after global convergence, not on every
-    trial iteration.
+    Optional overrides allow validation runs with custom material parameters
+    (e.g. Lourenço 1994 calibrated values for Raijmakers J4D specimen).
     """
     n_dof    = 2 * len(mesh.nodes)
     n_iface  = len(mesh.iface_nodes)
     n_mortar = len(mesh.mortar_elems)
-    p_iface  = IFaceParams()
+    p_iface  = p_iface_override if p_iface_override is not None else IFaceParams()
 
     def _fresh_mortar_states():
         return [[MortarGPState() for _ in range(4)] for _ in range(n_mortar)]
@@ -822,7 +825,7 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig) -> Dict:
     top_area = cfg.wall_width * THICK / max(len(mesh.top_nodes), 1)
     f_precomp = np.zeros(n_dof)
     for n in mesh.top_nodes:
-        f_precomp[2 * n + 1] += SIGMA_V * top_area
+        f_precomp[2 * n + 1] += sigma_v * top_area
 
     # One elastic solve for pre-compression (no plastic state committed)
     trial = [copy.copy(s) for s in saved_states]
@@ -836,9 +839,9 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig) -> Dict:
     # ---- Shear increments ----
     u_history = [0.0]
     F_history = [0.0]
-    du_step   = U_TOTAL / N_STEPS
+    du_step   = u_total / n_steps
 
-    for step in range(N_STEPS):
+    for step in range(n_steps):
         u_top = (step + 1) * du_step
         presc: Dict[int, float] = {d: 0.0 for d in mesh.fixed_dofs}
         for n in mesh.top_nodes:
@@ -889,11 +892,11 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig) -> Dict:
         u_history.append(u_top)
         F_history.append(F_react)
 
-        if step % max(N_STEPS // 8, 1) == 0 or step == N_STEPS - 1 or step < 5:
+        if step % max(n_steps // 8, 1) == 0 or step == n_steps - 1 or step < 5:
             n_plast = (sum(1 for s in saved_states
                            if s.kappa2 > 0 or s.kappa1 > s.__class__().kappa1) +
                        sum(1 for gp in saved_mortar_states for s in gp if s.kappa2 > 0))
-            print(f"  step {step+1:3d}/{N_STEPS}: u_top={u_top*1e3:.3f} mm  "
+            print(f"  step {step+1:3d}/{n_steps}: u_top={u_top*1e3:.3f} mm  "
                   f"F={F_react/1e3:.3f} kN  plastic={n_plast}  "
                   f"{'OK' if converged else 'NO-CONV'}")
 
