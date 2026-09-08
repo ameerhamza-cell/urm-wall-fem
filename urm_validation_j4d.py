@@ -75,6 +75,7 @@ res = urm.solve_wall(
     sigma_v=SIGMA_V_J4D,
     u_total=U_TOTAL_J4D,
     n_steps=N_STEPS_J4D,
+    rigid_top=True,
 )
 
 u_mm = res['u_history'] * 1e3

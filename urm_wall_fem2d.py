@@ -165,7 +165,8 @@ def iface_update(p: IFaceParams, s: IFaceState,
                  skip_mode2: bool = False) -> Tuple[float, float, float, float]:
     """
     Update interface state and return (sigma_n, tau, K_nn, K_ss).
-    skip_mode2=True: shear remains elastic (head joints — only Mode I cracking allowed).
+    skip_mode2=True (head joints): elastic shear only; prevents the running-bond
+        tilt cascade when bricks are free to rotate (no rigid-beam top BC).
     """
     from math import exp
 
@@ -190,12 +191,16 @@ def iface_update(p: IFaceParams, s: IFaceState,
         K_nn    = p.kn
 
     # ---- Mode II (shear) ----
-    # Head joints (skip_mode2=True): elastic shear only.
-    # Running-bond kinematics cause large vertical shear at head joints; allowing
-    # Mode II yield there drives K_ff → singular and prevents bed-joint sliding.
     if skip_mode2:
-        tau  = p.ks * (us - s.up)   # s.up stays 0 for head joints
-        K_ss = p.ks
+        # For an open Mode I crack (joint in tension AND damaged), there is no
+        # shear stiffness across the gap.  Retain a tiny value to keep K non-singular.
+        if s.d1 > 0.0 and un > 0.0:
+            K_ss_eff = p.ks * 1e-4
+            tau  = K_ss_eff * (us - s.up)
+            K_ss = K_ss_eff
+        else:
+            tau  = p.ks * (us - s.up)
+            K_ss = p.ks
         return sigma_n, tau, K_nn, K_ss
 
     c0_eff = p.c0 * (1.0 - s.d1)
@@ -229,8 +234,6 @@ def iface_update(p: IFaceParams, s: IFaceState,
         s.kappa2 = k0 + dGamma
         s.up    += dGamma * sign
         tau      = (tt_abs - p.ks * dGamma) * sign
-        # Secant stiffness: |tau|/|us_total|. Positive definite; avoids both
-        # K_ss=0 cascade and K_ss=KS spurious-equilibrium. Capped at KS.
         K_ss = min(p.ks, abs(tau) / max(abs(us), 1e-15))
 
     return sigma_n, tau, K_nn, K_ss
@@ -748,8 +751,8 @@ def assemble(mesh: FEMesh, u: np.ndarray,
         jump  = B_mid @ ue    # [Δu_n, Δu_s]
         un, us = float(jump[0]), float(jump[1])
 
-        # Head joints (not horiz): elastic shear to prevent running-bond tilt cascade.
-        # Bed joints (horiz): secant K_ss allows plastic slip accumulation.
+        # Head joints (not horiz): skip_mode2=True keeps K_ss=KS unless the
+        # caller has set rigid_top_beam which prevents the tilt instability.
         sigma_n, tau, K_nn, K_ss = iface_update(p_iface, st, un, us,
                                                   skip_mode2=(not horiz))
 
@@ -796,20 +799,53 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig,
                p_iface_override: Optional[IFaceParams] = None,
                sigma_v: float = SIGMA_V,
                u_total: float = U_TOTAL,
-               n_steps: int = N_STEPS) -> Dict:
+               n_steps: int = N_STEPS,
+               rigid_top: bool = False) -> Dict:
     """
     Incremental-iterative Newton-Raphson solver.
     Loading:
       1. Single elastic step for vertical pre-compression.
       2. Monotonic horizontal displacement ramp at top nodes.
 
-    Optional overrides allow validation runs with custom material parameters
-    (e.g. Lourenço 1994 calibrated values for Raijmakers J4D specimen).
+    rigid_top=True: adds a high-stiffness beam coupling all top-node y-DOFs
+        together, matching the rigid loading-plate boundary condition of the
+        Raijmakers & Vermeltfoort (1992) shear-wall test.  Prevents running-bond
+        brick tilt and allows head-joint Mode II to activate without cascade.
     """
     n_dof    = 2 * len(mesh.nodes)
     n_iface  = len(mesh.iface_nodes)
     n_mortar = len(mesh.mortar_elems)
     p_iface  = p_iface_override if p_iface_override is not None else IFaceParams()
+
+    # ---- Rigid top-beam penalty stiffness ----
+    # K_beam couples consecutive top-node y-DOFs: K*(u_yi - u_yj)^2.
+    # K_beam >> K_mortar so the coupling is nearly rigid.
+    K_beam = 100.0 * KN * cfg.wall_width * THICK  # ≈ 100 × whole-wall stiffness
+    _top_sorted = sorted(mesh.top_nodes,
+                         key=lambda n: mesh.nodes[n, 0])  # left→right
+
+    def _add_beam_stiffness(K: np.ndarray) -> None:
+        """Add penalty beam coupling to K (in-place) if rigid_top is active."""
+        if not rigid_top or len(_top_sorted) < 2:
+            return
+        for na, nb in zip(_top_sorted[:-1], _top_sorted[1:]):
+            da, db = 2 * na + 1, 2 * nb + 1   # y-DOFs
+            K[da, da] += K_beam
+            K[db, db] += K_beam
+            K[da, db] -= K_beam
+            K[db, da] -= K_beam
+
+    def _beam_fint(u: np.ndarray) -> np.ndarray:
+        """Return beam internal force vector so it can be included in residual."""
+        fb = np.zeros(n_dof)
+        if not rigid_top or len(_top_sorted) < 2:
+            return fb
+        for na, nb in zip(_top_sorted[:-1], _top_sorted[1:]):
+            da, db = 2 * na + 1, 2 * nb + 1
+            f_ab = K_beam * (u[da] - u[db])
+            fb[da] += f_ab
+            fb[db] -= f_ab
+        return fb
 
     def _fresh_mortar_states():
         return [[MortarGPState() for _ in range(4)] for _ in range(n_mortar)]
@@ -830,6 +866,7 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig,
     # One elastic solve for pre-compression (no plastic state committed)
     trial = [copy.copy(s) for s in saved_states]
     K0, _ = assemble(mesh, u, trial, p_iface, _fresh_mortar_states())
+    _add_beam_stiffness(K0)
     K_bc, f_bc = apply_bcs(K0, f_precomp, mesh.fixed_dofs,
                             {d: 0.0 for d in mesh.fixed_dofs})
     u = np.linalg.solve(K_bc, f_bc)
@@ -860,6 +897,8 @@ def solve_wall(mesh: FEMesh, cfg: WallConfig,
             trial        = [copy.copy(s) for s in saved_states]
             trial_mortar = _copy_mortar_states(saved_mortar_states)
             K, fi = assemble(mesh, u, trial, p_iface, trial_mortar)
+            _add_beam_stiffness(K)
+            fi += _beam_fint(u)
 
             res      = f_precomp - fi
             res_norm = np.linalg.norm(res[free])
